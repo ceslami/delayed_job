@@ -154,18 +154,6 @@ module Delayed
     attr_writer :name
 
     def start # rubocop:disable CyclomaticComplexity, PerceivedComplexity
-      trap('TERM') do
-        Thread.new { say 'Exiting...' }
-        stop
-        raise SignalException, 'TERM' if self.class.raise_signal_exceptions
-      end
-
-      trap('INT') do
-        Thread.new { say 'Exiting...' }
-        stop
-        raise SignalException, 'INT' if self.class.raise_signal_exceptions && self.class.raise_signal_exceptions != :term
-      end
-
       say 'Starting job worker'
 
       self.class.lifecycle.run_callbacks(:execute, self) do
