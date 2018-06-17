@@ -6,6 +6,7 @@ require 'active_support/hash_with_indifferent_access'
 require 'active_support/core_ext/hash/indifferent_access'
 require 'logger'
 require 'benchmark'
+require 'concurrent'
 
 module Delayed
   class Worker # rubocop:disable ClassLength
@@ -28,9 +29,6 @@ module Delayed
     cattr_accessor :default_queue_name
 
     cattr_reader :backend, :queue_attributes
-
-    # name_prefix is ignored if name is set directly
-    attr_accessor :name_prefix
 
     def self.reset
       self.default_log_level = DEFAULT_LOG_LEVEL
@@ -140,112 +138,116 @@ module Delayed
       self.class.setup_lifecycle
     end
 
-    # Every worker has a unique name which by default is the pid of the process. There are some
-    # advantages to overriding this with something which survives worker restarts:  Workers can
-    # safely resume working on tasks which are locked by themselves. The worker will assume that
-    # it crashed before.
-    def name
-      return @name unless @name.nil?
-      "#{@name_prefix}host:#{Socket.gethostname} pid:#{Process.pid}" rescue "#{@name_prefix}pid:#{Process.pid}"
-    end
-
-    # Sets the name of the worker.
-    # Setting the name to nil will reset the default worker name
-    attr_writer :name
-
     def start # rubocop:disable CyclomaticComplexity, PerceivedComplexity
-      say 'Starting job worker'
+      puts 'Starting job worker'
 
       self.class.lifecycle.run_callbacks(:execute, self) do
-        loop do
-          self.class.lifecycle.run_callbacks(:loop, self) do
-            @realtime = Benchmark.realtime do
-              @result = work_off
+        pool = Concurrent::FixedThreadPool.new 5, max_queue: 5
+        ledger = []
+
+        begin
+          loop do
+            if pool.remaining_capacity > 0
+              pool.post do
+                ExecuteJob.new(
+                  max_attempts: 25,
+                  max_runtime: 4.hours,
+                  logger: logger,
+                  default_log_level: 'info'.freeze,
+                  ledger: ledger
+                ).perform
+              end
+            else
+              sleep self.class.sleep_delay
             end
           end
+        rescue SignalException
+          pool.kill
+          Delayed::Job.where(id: ledger).update_all locked_at: nil, locked_by: nil
+          pool.wait_for_termination
+        end
+      end
+    end
 
-          count = @result[0] + @result[1]
+    class ExecuteJob
+      def initialize(max_attempts:, max_runtime:, logger:, default_log_level:, ledger:)
+        logger.info 'starting init'
+        @max_attempts_count = max_attempts
+        @max_runtime_minutes = max_runtime
+        @logger = logger
+        @default_log_level = default_log_level
+        @ledger = ledger
+      end
 
-          if count.zero?
-            if self.class.exit_on_complete
-              say 'No more jobs available. Exiting'
-              break
-            elsif !stop?
-              sleep(self.class.sleep_delay)
-              reload!
-            end
+      def perform
+        ActiveRecord::Base.connection_pool.with_connection do
+          realtime = Benchmark.realtime do
+            result = work_off(1)
+          end
+        end
+      end
+
+      attr_reader :logger, :max_attempts_count, :max_runtime_minutes, :default_log_level, :ledger
+
+      # Do num jobs and return stats on success/failure.
+      # Exit early if interrupted.
+      def work_off(num = 100)
+        success = 0
+        failure = 0
+
+        num.times do
+          case reserve_and_run_one_job
+          when true
+            success += 1
+          when false
+            failure += 1
           else
-            say format("#{count} jobs processed at %.4f j/s, %d failed", count / @realtime, @result.last)
+            logger.info 'no work could be done'
+            break # leave if no work could be done
           end
-
-          break if stop?
         end
+
+        [success, failure]
       end
-    end
 
-    def stop
-      @exit = true
-    end
-
-    def stop?
-      !!@exit
-    end
-
-    # Do num jobs and return stats on success/failure.
-    # Exit early if interrupted.
-    def work_off(num = 100)
-      success = 0
-      failure = 0
-
-      num.times do
-        case reserve_and_run_one_job
-        when true
-          success += 1
-        when false
-          failure += 1
-        else
-          break # leave if no work could be done
+      def run(job)
+        job_say job, 'RUNNING'
+        runtime = Benchmark.realtime do
+          Timeout.timeout(max_run_time(job).to_i, WorkerTimeout) {
+            job_say job, 'inside timeout'
+            job.invoke_job
+          }
+          job.destroy
+          ledger.delete(job.id)
         end
-        break if stop? # leave if we're exiting
-      end
+        job_say job, format('COMPLETED after %.4f', runtime)
+        return true # did work
+      rescue DeserializationError => error
+        job_say job, "FAILED permanently with #{error.class.name}: #{error.message}", 'error'
 
-      [success, failure]
-    end
-
-    def run(job)
-      job_say job, 'RUNNING'
-      runtime = Benchmark.realtime do
-        Timeout.timeout(max_run_time(job).to_i, WorkerTimeout) { job.invoke_job }
-        job.destroy
-      end
-      job_say job, format('COMPLETED after %.4f', runtime)
-      return true # did work
-    rescue DeserializationError => error
-      job_say job, "FAILED permanently with #{error.class.name}: #{error.message}", 'error'
-
-      job.error = error
-      failed(job)
-    rescue Exception => error # rubocop:disable RescueException
-      self.class.lifecycle.run_callbacks(:error, self, job) { handle_failed_job(job, error) }
-      return false # work failed
-    end
-
-    # Reschedule the job in the future (when a job fails).
-    # Uses an exponential scale depending on the number of failed attempts.
-    def reschedule(job, time = nil)
-      if (job.attempts += 1) < max_attempts(job)
-        time ||= job.reschedule_at
-        job.run_at = time
-        job.unlock
-        job.save!
-      else
-        job_say job, "REMOVED permanently because of #{job.attempts} consecutive failures", 'error'
+        job.error = error
         failed(job)
+      rescue Exception => error # rubocop:disable RescueException
+        logger.info error.backtrace
+        handle_failed_job(job, error)
+        return false # work failed
       end
-    end
 
-    def failed(job)
-      self.class.lifecycle.run_callbacks(:failure, self, job) do
+      # Reschedule the job in the future (when a job fails).
+      # Uses an exponential scale depending on the number of failed attempts.
+      def reschedule(job, time = nil)
+        if (job.attempts += 1) < max_attempts(job)
+          time ||= job.reschedule_at
+          job.run_at = time
+          job.unlock
+          job.save!
+        else
+          job_say job, "REMOVED permanently because of #{job.attempts} consecutive failures", 'error'
+          failed(job)
+        end
+      end
+
+      def failed(job)
         begin
           job.hook(:failure)
         rescue => error
@@ -255,70 +257,67 @@ module Delayed
           job.destroy_failed_jobs? ? job.destroy : job.fail!
         end
       end
-    end
 
-    def job_say(job, text, level = default_log_level)
-      text = "Job #{job.name} (id=#{job.id})#{say_queue(job.queue)} #{text}"
-      say text, level
-    end
-
-    def say(text, level = default_log_level)
-      text = "[Worker(#{name})] #{text}"
-      puts text unless @quiet
-      return unless logger
-      # TODO: Deprecate use of Fixnum log levels
-      unless level.is_a?(String)
-        level = Logger::Severity.constants.detect { |i| Logger::Severity.const_get(i) == level }.to_s.downcase
+      def job_say(job, text, level = default_log_level)
+        text = "Job #{job.name} (id=#{job.id})#{say_queue(job.queue)} #{text}"
+        say text, level
       end
-      logger.send(level, "#{Time.now.strftime('%FT%T%z')}: #{text}")
-    end
 
-    def max_attempts(job)
-      job.max_attempts || self.class.max_attempts
-    end
+      def say(text, level = default_log_level)
+        text = "[Worker(#{name})] #{text}"
+        puts text unless @quiet
+        return unless logger
+        # TODO: Deprecate use of Fixnum log levels
+        unless level.is_a?(String)
+          level = Logger::Severity.constants.detect { |i| Logger::Severity.const_get(i) == level }.to_s.downcase
+        end
+        logger.send(level, "#{Time.now.strftime('%FT%T%z')}: #{text}")
+      end
 
-    def max_run_time(job)
-      job.max_run_time || self.class.max_run_time
-    end
+      def max_attempts(job)
+        job.max_attempts || max_attempts_count
+      end
 
-  protected
+      def max_run_time(job)
+        job.max_run_time || max_runtime_minutes
+      end
 
-    def say_queue(queue)
-      " (queue=#{queue})" if queue
-    end
+      attr_reader :max_attempts_count, :max_runtime_minutes, :logger
 
-    def handle_failed_job(job, error)
-      job.error = error
-      job_say job, "FAILED (#{job.attempts} prior attempts) with #{error.class.name}: #{error.message}", 'error'
-      reschedule(job)
-    end
+      def name
+        "host:#{Socket.gethostname} pid:#{Process.pid} thread:#{Thread.current.object_id}"
+      rescue
+        "pid:#{Process.pid} thread:#{Thread.current.object_id}"
+      end
 
-    # Run the next job we can get an exclusive lock on.
-    # If no jobs are left we return nil
-    def reserve_and_run_one_job
-      job = reserve_job
-      self.class.lifecycle.run_callbacks(:perform, self, job) { run(job) } if job
-    end
+      def say_queue(queue)
+        " (queue=#{queue})" if queue
+      end
 
-    def reserve_job
-      job = Delayed::Job.reserve(self)
-      @failed_reserve_count = 0
-      job
-    rescue ::Exception => error # rubocop:disable RescueException
-      say "Error while reserving job: #{error}"
-      Delayed::Job.recover_from(error)
-      @failed_reserve_count += 1
-      raise FatalBackendError if @failed_reserve_count >= 10
-      nil
-    end
+      def handle_failed_job(job, error)
+        job.error = error
+        job_say job, "FAILED (#{job.attempts} prior attempts) with #{error.class.name}: #{error.message}", 'error'
+        reschedule(job)
+      end
 
-    def reload!
-      return unless self.class.reload_app?
-      if defined?(ActiveSupport::Reloader)
-        Rails.application.reloader.reload!
-      else
-        ActionDispatch::Reloader.cleanup!
-        ActionDispatch::Reloader.prepare!
+      # Run the next job we can get an exclusive lock on.
+      # If no jobs are left we return nil
+      def reserve_and_run_one_job
+        job = reserve_job
+        run(job) if job
+      end
+
+      def reserve_job
+        job = Delayed::Job.reserve(self)
+        ledger << job.id
+        @failed_reserve_count = 0
+        job
+      rescue ::Exception => error # rubocop:disable RescueException
+        say "Error while reserving job: #{error}"
+        Delayed::Job.recover_from(error)
+        @failed_reserve_count += 1
+        raise FatalBackendError if @failed_reserve_count >= 10
+        nil
       end
     end
   end
