@@ -19,11 +19,13 @@ module Delayed
     DEFAULT_QUEUES           = [].freeze
     DEFAULT_QUEUE_ATTRIBUTES = HashWithIndifferentAccess.new.freeze
     DEFAULT_READ_AHEAD       = 5
+    DEFAULT_QUIET            = true
+    DEFAULT_POOL_SIZE        = 1
 
     cattr_accessor :min_priority, :max_priority, :max_attempts, :max_run_time,
                    :default_priority, :sleep_delay, :logger, :delay_jobs, :queues,
                    :read_ahead, :plugins, :destroy_failed_jobs, :exit_on_complete,
-                   :default_log_level
+                   :default_log_level, :quiet, :pool_size
 
     # Named queue into which jobs are enqueued by default
     cattr_accessor :default_queue_name
@@ -40,24 +42,17 @@ module Delayed
       self.queues            = DEFAULT_QUEUES
       self.queue_attributes  = DEFAULT_QUEUE_ATTRIBUTES
       self.read_ahead        = DEFAULT_READ_AHEAD
+      self.quiet             = DEFAULT_QUIET
+      self.pool_size         = DEFAULT_POOL_SIZE
       @lifecycle             = nil
     end
 
     # Add or remove plugins in this list before the worker is instantiated
-    self.plugins = [Delayed::Plugins::ClearLocks]
+    self.plugins = []
 
     # By default failed jobs are destroyed after too many attempts. If you want to keep them around
     # (perhaps to inspect the reason for the failure), set this to false.
     self.destroy_failed_jobs = true
-
-    # By default, Signals INT and TERM set @exit, and the worker exits upon completion of the current job.
-    # If you would prefer to raise a SignalException and exit immediately you can use this.
-    # Be aware daemons uses TERM to stop and restart
-    # false - No exceptions will be raised
-    # :term - Will only raise an exception on TERM signals but INT will wait for the current job to finish
-    # true - Will raise an exception on TERM and INT
-    cattr_accessor :raise_signal_exceptions
-    self.raise_signal_exceptions = false
 
     def self.backend=(backend)
       if backend.is_a? Symbol
@@ -72,10 +67,6 @@ module Delayed
     # rubocop:disable ClassVars
     def self.queue_attributes=(val)
       @@queue_attributes = val.with_indifferent_access
-    end
-
-    def self.guess_backend
-      warn '[DEPRECATION] guess_backend is deprecated. Please remove it from your code.'
     end
 
     def self.before_fork
@@ -113,10 +104,6 @@ module Delayed
       plugins.each { |klass| klass.new }
     end
 
-    def self.reload_app?
-      defined?(ActionDispatch::Reloader) && Rails.application.config.cache_classes == false
-    end
-
     def self.delay_job?(job)
       if delay_jobs.is_a?(Proc)
         delay_jobs.arity == 1 ? delay_jobs.call(job) : delay_jobs.call
@@ -126,10 +113,9 @@ module Delayed
     end
 
     def initialize(options = {})
-      @quiet = options.key?(:quiet) ? options[:quiet] : true
       @failed_reserve_count = 0
 
-      [:min_priority, :max_priority, :sleep_delay, :read_ahead, :queues, :exit_on_complete].each do |option|
+      [:quiet, :min_priority, :max_priority, :sleep_delay, :read_ahead, :queues, :exit_on_complete].each do |option|
         self.class.send("#{option}=", options[option]) if options.key?(option)
       end
 
@@ -142,19 +128,16 @@ module Delayed
       puts 'Starting job worker'
 
       self.class.lifecycle.run_callbacks(:execute, self) do
-        pool = Concurrent::FixedThreadPool.new 5, max_queue: 5
-        ledger = []
-
         begin
           loop do
-            if pool.remaining_capacity > 0
-              pool.post do
+            if thread_pool.remaining_capacity > 0
+              thread_pool.post do
                 ExecuteJob.new(
-                  max_attempts: 25,
-                  max_runtime: 4.hours,
-                  logger: logger,
-                  default_log_level: 'info'.freeze,
-                  ledger: ledger
+                  default_max_attempts: self.class.max_attempts,
+                  default_max_runtime: self.class.max_run_time,
+                  default_log_level: self.class.default_log_level,
+                  logger: self.class.logger,
+                  quiet: self.class.quiet
                 ).perform
               end
             else
@@ -162,35 +145,58 @@ module Delayed
             end
           end
         rescue SignalException
-          pool.kill
-          Delayed::Job.where(id: ledger).update_all locked_at: nil, locked_by: nil
-          pool.wait_for_termination
+          thread_pool.kill
+          clear_orphaned_jobs!
+          thread_pool.wait_for_termination
         end
       end
     end
 
+    def thread_pool
+      @thread_pool ||= Concurrent::FixedThreadPool.new(self.class.pool_size, max_queue: self.class.pool_size)
+    end
+
+    def clear_orphaned_jobs!
+      Delayed::Job.where('locked_by like ?', "%pid:%#{Process.pid}%").update_all locked_at: nil, locked_by: nil
+    end
+
+    def work_off(count = 100)
+      ExecuteJob.new(
+        default_max_attempts: 25,
+        default_max_runtime: 4.hours,
+        default_log_level: 'info'.freeze,
+        logger: self.class.logger,
+        quiet: self.class.quiet,
+        count: count
+      ).perform
+    end
+
     class ExecuteJob
-      def initialize(max_attempts:, max_runtime:, logger:, default_log_level:, ledger:)
-        logger.info 'starting init'
-        @max_attempts_count = max_attempts
-        @max_runtime_minutes = max_runtime
-        @logger = logger
+      def initialize(default_max_attempts:, default_max_runtime:, default_log_level:, logger:, quiet:, count: 1)
+        @default_max_attempts = default_max_attempts
+        @default_max_runtime = default_max_runtime
         @default_log_level = default_log_level
-        @ledger = ledger
+        @logger = logger
+        @quiet = quiet
+        @count = count
       end
 
       def perform
         ActiveRecord::Base.connection_pool.with_connection do
-          realtime = Benchmark.realtime do
-            result = work_off(1)
-          end
+          work_off count
         end
       end
 
-      attr_reader :logger, :max_attempts_count, :max_runtime_minutes, :default_log_level, :ledger
+      def name
+        "host:#{Socket.gethostname} pid:#{Process.pid} thread:#{Thread.current.object_id}"
+      rescue
+        "pid:#{Process.pid} thread:#{Thread.current.object_id}"
+      end
 
-      # Do num jobs and return stats on success/failure.
-      # Exit early if interrupted.
+      private
+
+      attr_reader :default_max_attempts, :default_max_runtime, :logger, :default_log_level, :quiet, :count
+
       def work_off(num = 100)
         success = 0
         failure = 0
@@ -202,8 +208,7 @@ module Delayed
           when false
             failure += 1
           else
-            logger.info 'no work could be done'
-            break # leave if no work could be done
+            break
           end
         end
 
@@ -214,14 +219,12 @@ module Delayed
         job_say job, 'RUNNING'
         runtime = Benchmark.realtime do
           Timeout.timeout(max_run_time(job).to_i, WorkerTimeout) {
-            job_say job, 'inside timeout'
             job.invoke_job
           }
           job.destroy
-          ledger.delete(job.id)
         end
         job_say job, format('COMPLETED after %.4f', runtime)
-        return true # did work
+        return true
       rescue DeserializationError => error
         job_say job, "FAILED permanently with #{error.class.name}: #{error.message}", 'error'
 
@@ -230,7 +233,7 @@ module Delayed
       rescue Exception => error # rubocop:disable RescueException
         logger.info error.backtrace
         handle_failed_job(job, error)
-        return false # work failed
+        return false
       end
 
       # Reschedule the job in the future (when a job fails).
@@ -265,29 +268,16 @@ module Delayed
 
       def say(text, level = default_log_level)
         text = "[Worker(#{name})] #{text}"
-        puts text unless @quiet
-        return unless logger
-        # TODO: Deprecate use of Fixnum log levels
-        unless level.is_a?(String)
-          level = Logger::Severity.constants.detect { |i| Logger::Severity.const_get(i) == level }.to_s.downcase
-        end
-        logger.send(level, "#{Time.now.strftime('%FT%T%z')}: #{text}")
+        puts text unless quiet
+        logger.send level, "#{Time.now.strftime('%FT%T%z')}: #{text}"
       end
 
       def max_attempts(job)
-        job.max_attempts || max_attempts_count
+        job.max_attempts || default_max_attempts
       end
 
       def max_run_time(job)
-        job.max_run_time || max_runtime_minutes
-      end
-
-      attr_reader :max_attempts_count, :max_runtime_minutes, :logger
-
-      def name
-        "host:#{Socket.gethostname} pid:#{Process.pid} thread:#{Thread.current.object_id}"
-      rescue
-        "pid:#{Process.pid} thread:#{Thread.current.object_id}"
+        job.max_run_time || default_max_runtime
       end
 
       def say_queue(queue)
@@ -300,8 +290,6 @@ module Delayed
         reschedule(job)
       end
 
-      # Run the next job we can get an exclusive lock on.
-      # If no jobs are left we return nil
       def reserve_and_run_one_job
         job = reserve_job
         run(job) if job
@@ -309,7 +297,6 @@ module Delayed
 
       def reserve_job
         job = Delayed::Job.reserve(self)
-        ledger << job.id
         @failed_reserve_count = 0
         job
       rescue ::Exception => error # rubocop:disable RescueException
